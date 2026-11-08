@@ -1,0 +1,705 @@
+using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Threading;
+using PhoenixLeecher.Models;
+using PhoenixLeecher.Services;
+
+namespace PhoenixLeecher;
+
+public partial class MainWindow : Window
+{
+    private readonly ConcurrentDictionary<string, LeecherEntry> _entries = new();
+    private readonly ObservableCollection<LeecherEntry> _rows = new();
+    private readonly Dictionary<string, LeecherEntry> _byId = new();
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _dlCts = new();
+    private readonly ConcurrentDictionary<string, Task> _dlTasks = new();
+    private bool _isBatchRunning;
+    private readonly List<string> _bothFailedNames = new(); // guarded by lock(_bothFailedNames)
+    private readonly Dictionary<string, string> _passwords = new();
+    private readonly LinkScanner _scanner = new();
+    private int _lastScanSavedCount; // throttle SaveEntries during Whole scan
+    private DownloadEngine _engine = new(maxConcurrentFiles: 3);
+    private CancellationTokenSource? _scanCts;
+    private CancellationTokenSource? _dlBatchCts; // Download All batch token; Pause All cancels it too
+    private bool _scanRunning;
+    private static string EntriesPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhoenixLeecher", "entries.json");
+    private readonly IProgress<EntryTick> _tickProgress;
+    private readonly IProgress<ScanProgress> _scanProgress;
+    private readonly DispatcherTimer _syncTimer = new();
+
+    public MainWindow()
+    {
+        InitializeComponent();
+        var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+        Title = $"Phoenix Leecher v{v?.Major}.{v?.Minor}.{v?.Build}";
+        Grid.ItemsSource = _rows;
+
+        _tickProgress = new Progress<EntryTick>(ApplyTick);
+        _scanProgress = new Progress<ScanProgress>(ApplyScanProgress);
+
+        _syncTimer.Interval = TimeSpan.FromMilliseconds(500);
+        _syncTimer.Tick += (_, _) => SyncRows();
+        _syncTimer.Start();
+
+        // Custom download folder (user spec 2026-11-08): apply the saved
+        // folder before anything reads DownloadRoot (status bar, LoadEntries).
+        DownloadEngine.SetDownloadRoot(AppSettings.LoadDownloadFolder());
+        StatusFolder.Text = DownloadEngine.DownloadRoot;
+        LoadEntries(); // restore list from previous session (no auto-download)
+        UpdateCounts();
+        Closing += (_, _) => SaveEntries();
+    }
+
+    // ---------- rows sync (UI thread) ----------
+    private void RenumberRows()
+    {
+        for (int i = 0; i < _rows.Count; i++)
+            _rows[i].RowNumber = i + 1;
+    }
+
+    private void SyncRows()
+    {
+        foreach (var kv in _entries)
+        {
+            if (!_byId.ContainsKey(kv.Value.Id))
+            {
+                _byId[kv.Value.Id] = kv.Value;
+                // User spec 2026-10-17: don't show Completed in the visible list.
+                if (kv.Value.Status != EntryStatus.Completed)
+                    _rows.Add(kv.Value);
+            }
+        }
+        // removals
+        for (int i = _rows.Count - 1; i >= 0; i--)
+            if (!_byId.ContainsKey(_rows[i].Id))
+            {
+                _byId.Remove(_rows[i].Id);
+                _rows.RemoveAt(i);
+            }
+        RenumberRows();
+        UpdateCounts();
+    }
+
+    private void UpdateCounts()
+    {
+        int done = _rows.Count(e => e.Status == EntryStatus.Completed);
+        double totalSpeed = _rows.Where(e => e.Status == EntryStatus.Downloading).Sum(e => e.SpeedBps);
+        StatusCounts.Text = $"Complete downloads {done} of {_rows.Count}";
+        StatusSpeed.Text = totalSpeed > 0 ? $"Current speed: {FormatSpeed(totalSpeed)}" : "";
+        EmptyState.Visibility = _rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static string FormatSpeed(double bps)
+    {
+        string[] u = { "B", "KB", "MB", "GB" };
+        double d = bps; int i = 0;
+        while (d >= 1024 && i < u.Length - 1) { d /= 1024; i++; }
+        return $"{d:F1} {u[i]}/s";
+    }
+
+    private void ApplyTick(EntryTick t)
+    {
+        if (!_byId.TryGetValue(t.EntryId, out var e)) return;
+        e.Status = t.Status;
+        e.DownloadedBytes = t.DownloadedBytes;
+        e.Progress = t.Progress;
+        e.SpeedBps = t.SpeedBps;
+        e.Elapsed = t.Elapsed;
+        e.StatusText = t.StatusText;
+        if (t.Status is EntryStatus.Completed or EntryStatus.Failed or EntryStatus.Paused)
+        {
+            if (_dlCts.Remove(t.EntryId, out var cts)) cts.Dispose();
+            // Both-links-failed: pCloud tried, MediaFire backup tried, both failed (user spec 2026-10-16).
+            if (t.Status == EntryStatus.Failed && e.BothLinksFailed)
+            {
+                lock (_bothFailedNames) _bothFailedNames.Add(e.DisplayName);
+                if (!_isBatchRunning)
+                {
+                    // Single download: notify immediately.
+                    MessageBox.Show($"Album '{e.DisplayName}': pCloud and MediaFire links both failed.",
+                        "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    lock (_bothFailedNames) _bothFailedNames.Clear();
+                }
+                // Batch: DownloadAll_Click shows one summary at the end.
+            }
+            SaveEntries();
+        }
+        UpdateCounts();
+    }
+
+    private void ApplyScanProgress(ScanProgress p)
+    {
+        ScanBar.Maximum = p.Target;
+        ScanBar.Value = p.AlbumsFound;
+        // Persist scan finds promptly (every 10) so a crash/kill doesn't lose dedup memory.
+        if (p.Running && p.AlbumsFound >= _lastScanSavedCount + 10)
+        {
+            _lastScanSavedCount = p.AlbumsFound;
+            SaveEntries();
+        }
+        ScanText.Text = p.Running
+            ? $"Scanning older posts… {p.AlbumsFound}/{p.Target} albums" +
+              (p.TotalPosts > 0 ? $" · post {p.PostsDone}/{p.TotalPosts}" : $" · {p.PostsDone} posts")
+            : $"Scan {p.Note}: {p.AlbumsFound}/{p.Target} albums";
+        if (!p.Running)
+        {
+            ScanBtn.IsEnabled = true;
+            StopBtn.IsEnabled = false;
+            // Target reached -> cursor preserved + counter reset by Scanner (next Whole scan
+            // finds the NEXT 50). Exhausted -> clear (fresh start may find new posts).
+            // Stopped early -> keep for Resume.
+            if (p.AlbumsFound >= p.Target)
+            {
+                ScanBtnLabel.Text = "Whole scan";
+            }
+            else if (p.Note.Contains("exhaust"))
+            {
+                _scanner.ClearState(UrlBox.Text.Trim());
+                ScanBtnLabel.Text = "Whole scan";
+            }
+            else if (LinkScanner.IsBlogspot(UrlBox.Text.Trim()))
+            {
+                ScanBtnLabel.Text = $"Resume scan ({p.AlbumsFound}/{p.Target})";
+            }
+        }
+    }
+
+    private string CurrentUrl => UrlBox.Text.Trim();
+
+    // ---------- Find Links (immediate, page only) ----------
+    // ---------- Find Links (immediate, page only). Returns new unique albums found. ----------
+    private async Task<int> DoFindLinksAsync()
+    {
+        string url = CurrentUrl; // capture on UI thread: UrlBox cannot be read from a worker thread
+        if (string.IsNullOrWhiteSpace(url)) return 0;
+        // Direct link support (user request 2026-10-16): if the pasted URL IS a
+        // pCloud/MediaFire share link, resolve it directly instead of fetching as a page.
+        if (LinkScanner.IsShareLink(url))
+        {
+            var (_, isNew) = await Task.Run(() => _scanner.ResolveAndAddAsync(url, _entries, null, CancellationToken.None));
+            SyncRows();
+            return isNew ? 1 : 0;
+        }
+        var links = await Task.Run(() => _scanner.FindLinksAsync(url, CancellationToken.None));
+        int newAlbums = 0;
+        await Task.Run(async () =>
+        {
+            foreach (var link in links)
+            {
+                var (_, isNew) = await _scanner.ResolveAndAddAsync(link, _entries, null, CancellationToken.None);
+                if (isNew) { newAlbums++; SaveEntries(); }
+            }
+        });
+        SyncRows();
+        return newAlbums;
+    }
+
+    // ---------- Page scan (immediate, page only) ----------
+    private async void PageScan_Click(object sender, RoutedEventArgs e)
+    {
+        if (_scanRunning) return;
+        SetScanRunning(true);
+        _lastScanSavedCount = 0;
+        try { await DoFindLinksAsync(); }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Page scan failed: " + ex.Message, "Phoenix Leecher",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally { SaveEntries(); SetScanRunning(false); }
+    }
+
+    // ---------- Whole scan (page + older posts, 50 NEW albums, resumable) ----------
+    private async void WholeScan_Click(object sender, RoutedEventArgs e)
+    {
+        if (_scanRunning) return;
+        string url = CurrentUrl; // capture on UI thread: UrlBox cannot be read from a worker thread
+        if (string.IsNullOrWhiteSpace(url)) return;
+        SetScanRunning(true);
+        _lastScanSavedCount = 0;
+        try
+        {
+            // Run model (user spec 2026-10-16):
+            // - Fresh: page links first (counted), then older-posts crawl to 50 NEW albums.
+            // - Stopped early (AlbumsFound in 1..49): resume from saved cursor, no page re-scrape.
+            // - Target reached (previous run hit 50): NEW run — cursor preserved, counter reset,
+            //   next 50 NEW albums; already-seen links are not re-counted (dedup).
+            var saved = _scanner.LoadState(url);
+            bool isBlog = LinkScanner.IsBlogspot(url);
+            bool targetReached = saved != null && saved.AlbumsFound >= LinkScanner.LinkTarget;
+            bool isResume = saved != null && !targetReached && saved.AlbumsFound > 0 && isBlog;
+
+            if (targetReached)
+            {
+                // Previous run completed 50: reset counter, keep cursor for the next 50.
+                saved!.AlbumsFound = 0;
+                _scanner.SaveState(saved);
+                isResume = true; // skip page re-scrape, continue from cursor
+            }
+
+            if (!isResume)
+            {
+                int pageAlbums = await DoFindLinksAsync();
+                // Seed the run counter with page albums so the feed crawl continues toward 50.
+                var s = _scanner.LoadState(url) ?? new ScanState { BlogUrl = url };
+                s.AlbumsFound = pageAlbums;
+                s.StartIndex = 1;
+                _scanner.SaveState(s);
+            }
+
+            _scanCts = new CancellationTokenSource();
+            StopBtn.IsEnabled = true;
+            ScanStrip.Visibility = Visibility.Visible;
+            await Task.Run(() => _scanner.ScanAsync(url, _entries, _scanProgress, _scanCts.Token));
+        }
+        catch (OperationCanceledException) { /* Stop pressed: state already saved */ }
+        catch (Exception ex)
+        {
+            MessageBox.Show("Scan failed: " + ex.Message, "Phoenix Leecher",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            SyncRows();
+            SaveEntries();
+            _scanCts?.Dispose();
+            _scanCts = null;
+            SetScanRunning(false);
+        }
+    }
+
+    private void SetScanRunning(bool running)
+    {
+        _scanRunning = running;
+        PageScanBtn.IsEnabled = !running;
+        ScanBtn.IsEnabled = !running;
+        StopBtn.IsEnabled = false; // enabled only by Whole scan below
+    }
+
+    private void Stop_Click(object sender, RoutedEventArgs e)
+    {
+        _scanCts?.Cancel();
+        StopBtn.IsEnabled = false;
+    }
+
+    // ---------- downloads ----------
+    /// <summary>Starts a download if possible. Returns true if a download was started.</summary>
+    private bool StartDownloadNow(LeecherEntry entry)
+    {
+        if (entry.Status == EntryStatus.Downloading) return false;
+        if (entry.Status == EntryStatus.NeedsPassword && string.IsNullOrEmpty(entry.Password))
+        {
+            MessageBox.Show("This link needs a password — enter it in the row and press Unlock.",
+                "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Information);
+            return false;
+        }
+        if (_dlCts.ContainsKey(entry.Id)) return false;
+        var cts = new CancellationTokenSource();
+        _dlCts[entry.Id] = cts;
+        var task = _engine.DownloadAsync(entry, _tickProgress, cts.Token);
+        _dlTasks[entry.Id] = task;
+        // Clean up the task slot when done (ApplyTick removes the CTS on terminal state).
+        _ = task.ContinueWith(_ => _dlTasks.TryRemove(entry.Id, out _), TaskScheduler.Default);
+        return true;
+    }
+
+    private void StartDownload(LeecherEntry entry) => StartDownloadNow(entry);
+
+    private void RowDownload_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is LeecherEntry entry)
+            StartDownload(entry);
+    }
+
+    private void RowPause_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is LeecherEntry entry &&
+            _dlCts.TryGetValue(entry.Id, out var cts))
+            cts.Cancel();
+    }
+
+    private async void DownloadAll_Click(object sender, RoutedEventArgs e)
+    {
+        // Cancel any previous batch, then run a new one. Pause All cancels this
+        // batch token too, so the loop stops instead of starting the next file.
+        _dlBatchCts?.Cancel();
+        _dlBatchCts?.Dispose();
+        var batchCts = new CancellationTokenSource();
+        _dlBatchCts = batchCts;
+        _isBatchRunning = true;
+        try
+        {
+            var list = _rows.Where(x => x.Status is EntryStatus.Ready or EntryStatus.Paused or EntryStatus.Failed).ToList();
+            foreach (var entry in list)
+            {
+                batchCts.Token.ThrowIfCancellationRequested();
+                // Start on the UI thread; skip if not started (already running / needs password).
+                bool started = (bool)Dispatcher.Invoke(() => StartDownloadNow(entry));
+                if (!started) continue;
+                // Wait for this entry's download task (or batch cancel) — no polling.
+                if (_dlTasks.TryGetValue(entry.Id, out var task))
+                    await Task.WhenAny(task, Task.Delay(Timeout.Infinite, batchCts.Token));
+            }
+        }
+        catch (OperationCanceledException) { /* Pause All pressed */ }
+        finally
+        {
+            _isBatchRunning = false;
+            if (_dlBatchCts == batchCts) { _dlBatchCts = null; batchCts.Dispose(); }
+            // Batch summary: albums where BOTH pCloud and MediaFire failed.
+            List<string> failed;
+            lock (_bothFailedNames) { failed = new List<string>(_bothFailedNames); _bothFailedNames.Clear(); }
+            if (failed.Count > 0)
+                MessageBox.Show("These albums failed on both pCloud and MediaFire:\n- " + string.Join("\n- ", failed),
+                    "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void PauseAll_Click(object sender, RoutedEventArgs e)
+    {
+        // Stop everything: the Download All batch loop plus every running file.
+        _dlBatchCts?.Cancel();
+        foreach (var cts in _dlCts.Values.ToList()) cts.Cancel();
+    }
+
+    private void ResumeAll_Click(object sender, RoutedEventArgs e)
+    {
+        foreach (var entry in _rows.Where(x => x.Status is EntryStatus.Paused or EntryStatus.Failed).ToList())
+            StartDownload(entry);
+    }
+
+    private void RemoveEntry(LeecherEntry entry)
+    {
+        if (_dlCts.TryGetValue(entry.Id, out var cts)) cts.Cancel();
+        // Completed: keep in _entries for dedup (never reappear in scans),
+        // remove from UI (_rows/_byId) only. Non-completed: remove fully.
+        if (entry.Status != EntryStatus.Completed)
+            _entries.TryRemove(entry.NormalizedKey, out _);
+        _byId.Remove(entry.Id);
+        _rows.Remove(entry);
+        _passwords.Remove(entry.Id);
+        SaveEntries();
+        UpdateCounts();
+    }
+
+    private void RowDelete_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is LeecherEntry entry)
+            RemoveEntry(entry);
+    }
+
+    private void DeleteSelected_Click(object sender, RoutedEventArgs e)
+    {
+        if (Grid.SelectedItem is LeecherEntry entry)
+            RemoveEntry(entry);
+    }
+
+    private void RemoveCompleted_Click(object sender, RoutedEventArgs e)
+    {
+        // List only: the downloaded files stay on disk.
+        foreach (var entry in _rows.Where(x => x.Status == EntryStatus.Completed).ToList())
+            RemoveEntry(entry);
+    }
+
+    private void Grid_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        // Click on empty area (not on a row) -> clear the blue selection.
+        DependencyObject? dep = e.OriginalSource as DependencyObject;
+        while (dep != null && dep is not DataGridRow && dep is not DataGridCell
+               && dep is not System.Windows.Controls.Primitives.ScrollBar && dep != Grid)
+            dep = VisualTreeHelper.GetParent(dep);
+        if (dep == Grid || dep == null)
+            Grid.UnselectAll();
+    }
+
+    // ---------- password (session-only, never persisted) ----------
+    private void PwBox_PasswordChanged(object sender, RoutedEventArgs e)
+    {
+        if (sender is PasswordBox pb && pb.DataContext is LeecherEntry entry)
+            _passwords[entry.Id] = pb.Password;
+    }
+
+    private async void Unlock_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not LeecherEntry entry) return;
+        _passwords.TryGetValue(entry.Id, out var pw);
+        entry.Status = EntryStatus.Resolving;
+        entry.StatusText = "Unlocking…";
+        try
+        {
+            string? url = entry.PrimaryHost == "pcloud" ? entry.PCloudShareUrl : entry.MediaFireShareUrl;
+            if (url == null)
+            {
+                entry.Status = EntryStatus.NeedsPassword;
+                entry.StatusText = "Password required";
+                return;
+            }
+            var (fresh, _) = await Task.Run(() => _scanner.ResolveAndAddAsync(url, _entries, pw, CancellationToken.None));
+            SyncRows();
+            if (fresh.Status == EntryStatus.NeedsPassword)
+            {
+                MessageBox.Show("Wrong password.", "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Warning);
+                entry.Status = EntryStatus.NeedsPassword;
+                entry.StatusText = "Password required";
+            }
+            else
+            {
+                fresh.Password = pw; // session only, never persisted
+            }
+        }
+        catch (Exception ex)
+        {
+            entry.Status = EntryStatus.Failed;
+            entry.StatusText = "Unlock failed: " + ex.Message;
+        }
+    }
+
+    // ---------- theme ----------
+    private void ThemeToggle_Click(object sender, RoutedEventArgs e)
+    {
+        if (App.ThemeName == "Light") ApplyDark(); else ApplyLight();
+    }
+    private void LogBtn_Click(object sender, RoutedEventArgs e)
+    {
+        var w = new LogWindow { Owner = this };
+        w.ShowDialog();
+    }
+    private void ThemeLight_Click(object sender, RoutedEventArgs e) => ApplyLight();
+    private void ThemeDark_Click(object sender, RoutedEventArgs e) => ApplyDark();
+    private void ApplyLight()
+    {
+        App.ApplyTheme("Light");
+        ThemeBtnLabel.Text = "Dark";
+        MenuLight.IsChecked = true; MenuDark.IsChecked = false;
+    }
+    private void ApplyDark()
+    {
+        App.ApplyTheme("Dark");
+        ThemeBtnLabel.Text = "Light";
+        MenuLight.IsChecked = false; MenuDark.IsChecked = true;
+    }
+
+    // ---------- misc ----------
+    private void Concurrency_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is MenuItem mi && int.TryParse(mi.Tag?.ToString(), out int n))
+        {
+            _engine = new DownloadEngine(maxConcurrentFiles: n);
+            foreach (var item in ((mi.Parent as MenuItem)?.Items.OfType<MenuItem>() ?? Enumerable.Empty<MenuItem>()))
+                item.IsChecked = item == mi;
+        }
+    }
+
+    private void OpenFolder_Click(object sender, RoutedEventArgs e)
+    {
+        Directory.CreateDirectory(DownloadEngine.DownloadRoot);
+        Process.Start("explorer.exe", DownloadEngine.DownloadRoot);
+    }
+
+    // ---------- download folder (user spec 2026-11-08) ----------
+    // Default stays Downloads\PhoenixLeecher (C:). The user picks any other
+    // folder; it is remembered in settings.json and new downloads go there.
+    // The user moves existing files himself in Explorer — the app moves nothing.
+    private void ChangeFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (_dlCts.Count > 0 || _isBatchRunning)
+        {
+            MessageBox.Show("Pause all downloads first, then change the download folder.",
+                "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+        var dlg = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Choose download folder",
+            InitialDirectory = DownloadEngine.DownloadRoot,
+        };
+        if (dlg.ShowDialog() != true || string.IsNullOrWhiteSpace(dlg.FolderName)) return;
+        string folder = dlg.FolderName;
+        if (string.Equals(folder, DownloadEngine.DownloadRoot, StringComparison.OrdinalIgnoreCase)) return;
+        Directory.CreateDirectory(folder);
+        AppSettings.SaveDownloadFolder(folder);
+        DownloadEngine.SetDownloadRoot(folder);
+        StatusFolder.Text = folder;
+        MessageBox.Show(
+            $"New downloads will be saved to:\n{folder}\n\nMove your existing files there yourself in Explorer — the app does not move them. " +
+            "Move the whole folder contents as-is (album folders, single files and .part files) so paused downloads can resume instead of restarting.",
+            "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    private void About_Click(object sender, RoutedEventArgs e) =>
+        new AboutWindow { Owner = this }.ShowDialog();
+
+    private void Exit_Click(object sender, RoutedEventArgs e) => Close();
+
+    // ---------- entry list persistence (user spec: list survives app restart) ----------
+    private sealed class SavedEntry
+    {
+        public string NormalizedKey { get; set; } = "";
+        public string DisplayName { get; set; } = "";
+        public bool IsFolder { get; set; }
+        public long TotalSize { get; set; }
+        public string PrimaryHost { get; set; } = "pcloud";
+        public string? PCloudShareUrl { get; set; }
+        public string? MediaFireShareUrl { get; set; }
+        public string Status { get; set; } = "Ready";
+        // User spec 2026-11-08: progress comes from json, not from a disk
+        // scan — the exact names + this byte count are the source of truth.
+        public long DownloadedBytes { get; set; }
+        public List<RemoteFile> Files { get; set; } = new();
+    }
+
+    private void SaveEntries()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(EntriesPath)!);
+            // Save in display order (_rows), not dict order, so the layout survives restart.
+            var list = _rows.Select(e => new SavedEntry
+            {
+                NormalizedKey = e.NormalizedKey,
+                DisplayName = e.DisplayName,
+                IsFolder = e.IsFolder,
+                TotalSize = e.TotalSize,
+                PrimaryHost = e.PrimaryHost,
+                PCloudShareUrl = e.PCloudShareUrl,
+                MediaFireShareUrl = e.MediaFireShareUrl,
+                Status = e.Status.ToString(),
+                DownloadedBytes = e.DownloadedBytes,
+                Files = e.Files.ToList(),
+            }).ToList();
+            // Also persist hidden Completed (in _entries but not in _rows, per user spec
+            // 2026-10-17) so dedup survives restart and Whole scan doesn't re-add them.
+            var visibleIds = new HashSet<string>(_rows.Select(e => e.Id));
+            foreach (var kv in _entries.Values)
+            {
+                if (kv.Status == EntryStatus.Completed && !visibleIds.Contains(kv.Id))
+                {
+                    list.Add(new SavedEntry
+                    {
+                        NormalizedKey = kv.NormalizedKey,
+                        DisplayName = kv.DisplayName,
+                        IsFolder = kv.IsFolder,
+                        TotalSize = kv.TotalSize,
+                        PrimaryHost = kv.PrimaryHost,
+                        PCloudShareUrl = kv.PCloudShareUrl,
+                        MediaFireShareUrl = kv.MediaFireShareUrl,
+                        Status = kv.Status.ToString(),
+                        DownloadedBytes = kv.DownloadedBytes,
+                        Files = kv.Files.ToList(),
+                    });
+                }
+            }
+            File.WriteAllText(EntriesPath, JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* persistence must never break the app */ }
+    }
+
+    private void LoadEntries()
+    {
+        try
+        {
+            if (!File.Exists(EntriesPath)) return;
+            var list = JsonSerializer.Deserialize<List<SavedEntry>>(File.ReadAllText(EntriesPath));
+            if (list == null) return;
+            var rebuilt = new List<LeecherEntry>();
+            foreach (var s in list)
+            {
+                // Mid-resolve entries (no files yet) can't download; user re-scans.
+                // Dead / NeedsPassword are link states, kept without files.
+                if (s.Files.Count == 0 && s.Status != "Dead" && s.Status != "NeedsPassword")
+                    continue;
+                var entry = new LeecherEntry
+                {
+                    DisplayName = s.DisplayName,
+                    NormalizedKey = s.NormalizedKey,
+                    IsFolder = s.IsFolder,
+                    FileCount = s.Files.Count,
+                    TotalSize = s.TotalSize,
+                    PrimaryHost = s.PrimaryHost,
+                };
+                entry.PCloudShareUrl = s.PCloudShareUrl;
+                entry.MediaFireShareUrl = s.MediaFireShareUrl;
+                foreach (var f in s.Files) entry.Files.Add(f);
+                // An interrupted download becomes Paused (its .part stays on disk, resumes via Range).
+                // Passwords are session-only -> protected links re-prompt after restart.
+                entry.Status = s.Status switch
+                {
+                    "Downloading" => EntryStatus.Paused,
+                    "Paused" => EntryStatus.Paused,
+                    "Completed" => EntryStatus.Completed,
+                    "Failed" => EntryStatus.Failed,
+                    "Dead" => EntryStatus.Dead,
+                    "NeedsPassword" => EntryStatus.NeedsPassword,
+                    _ => EntryStatus.Ready,
+                };
+                entry.StatusText = entry.Status switch
+                {
+                    EntryStatus.Completed => "Completed",
+                    EntryStatus.Failed => "Failed",
+                    EntryStatus.Dead => "Link dead",
+                    EntryStatus.NeedsPassword => "Password required",
+                    EntryStatus.Paused => "Paused",
+                    _ => "Ready",
+                };
+                // User spec 2026-11-08: progress comes from json, no disk scan.
+                // Legacy entries.json has no DownloadedBytes (defaults 0): fill it
+                // from disk this once so existing paused progress is not lost.
+                // After the first save the field exists and disk is never read again.
+                entry.DownloadedBytes = s.DownloadedBytes > 0
+                    ? s.DownloadedBytes
+                    : ExistingPartBytes(entry);
+                entry.Progress = entry.TotalSize > 0
+                    ? Math.Min(100, entry.DownloadedBytes * 100.0 / entry.TotalSize) : 0;
+                entry.RefreshDerived();
+                rebuilt.Add(entry);
+            }
+            // User spec 2026-10-17: Completed entries stay in _entries/_byId for dedup
+            // (Whole scan won't re-add them), but are NOT shown in _rows. This avoids
+            // the Download All crash triggered by Completed entries in the visible list.
+            foreach (var entry in rebuilt)
+            {
+                _entries[entry.NormalizedKey] = entry;
+                _byId[entry.Id] = entry;
+                if (entry.Status != EntryStatus.Completed)
+                    _rows.Add(entry);
+            }
+            RenumberRows();
+            UpdateCounts();
+        }
+        catch { /* a corrupt file must never break startup */ }
+    }
+
+    private static long ExistingPartBytes(LeecherEntry entry)
+    {
+        try
+        {
+            string targetDir = DownloadEngine.DownloadRoot;
+            if (entry.IsFolder) targetDir = Path.Combine(targetDir, DownloadEngine.Sanitize(entry.DisplayName));
+            long sum = 0;
+            foreach (var f in entry.Files)
+            {
+                string basePath = Path.Combine(targetDir, DownloadEngine.Sanitize(f.Name));
+                if (File.Exists(basePath + ".part")) sum += new FileInfo(basePath + ".part").Length;
+                else if (File.Exists(basePath)) sum += new FileInfo(basePath).Length;
+            }
+            return sum;
+        }
+        catch { return 0; }
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        _scanCts?.Cancel();
+        foreach (var cts in _dlCts.Values) cts.Cancel();
+        _syncTimer.Stop();
+        base.OnClosed(e);
+    }
+}
