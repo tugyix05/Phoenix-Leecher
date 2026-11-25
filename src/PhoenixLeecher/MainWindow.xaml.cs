@@ -699,6 +699,19 @@ public partial class MainWindow : Window
                 entry.RefreshDerived();
                 rebuilt.Add(entry);
             }
+            // v1.3.5 folder-vs-file (existing lists): drop Ready single-file
+            // entries whose base name equals a folder entry's name — the folder
+            // already has the file. Scan-time dedup in Scanner only sees freshly
+            // resolved links (known links hit the URL fast-path), so without this
+            // sweep the mp3 rows already saved in entries.json would stay forever.
+            var folderNames = new HashSet<string>(rebuilt.Where(e => e.IsFolder)
+                .Select(e => MyanmarText.NormalizeKey(e.DisplayName)));
+            rebuilt.RemoveAll(e =>
+            {
+                if (e.IsFolder || e.Status != EntryStatus.Ready) return false;
+                string k = LinkScanner.FileBaseKey(e.DisplayName);
+                return k.Length > 0 && folderNames.Contains(k);
+            });
             // User spec 2026-10-17: Completed entries stay in _entries/_byId for dedup
             // (Whole scan won't re-add them), but are NOT shown in _rows. This avoids
             // the Download All crash triggered by Completed entries in the visible list.
