@@ -51,6 +51,24 @@ public sealed class LinkScanner
     public static List<string> ExtractLinks(string text) =>
         LinkRe.Matches(text).Select(m => m.Value).Distinct().ToList();
 
+    // v1.3.5 folder-vs-file dedup: a single file's base name — audio extension
+    // stripped, then a leading track number ("01.", "01 -", "01 ") stripped —
+    // normalized, so "01.မစိမ်းပင် ဇာတ်လမ်း.mp3" matches folder "မစိမ်းပင် ဇာတ်လမ်း".
+    // Extension is stripped only when it is a known audio extension, so a
+    // folder/file name that merely contains a dot is never mangled.
+    private static readonly Regex AudioExtRe = new(@"\.(mp3|flac|m4a|wav|aac|ogg|opus|wma)$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex TrackNoRe = new(@"^\d{1,3}([-.]\s*|\s+)",
+        RegexOptions.Compiled);
+
+    public static string FileBaseKey(string insideName)
+    {
+        string name = insideName ?? "";
+        name = AudioExtRe.Replace(name, "");
+        name = TrackNoRe.Replace(name, "");
+        return MyanmarText.NormalizeKey(name);
+    }
+
     /// <summary>True if the URL itself is a pCloud/MediaFire share link (for direct paste support).</summary>
     public static bool IsShareLink(string url) =>
         !string.IsNullOrWhiteSpace(url) && LinkRe.IsMatch(url.Trim());
@@ -263,6 +281,10 @@ public sealed class LinkScanner
             if (ShareResolver.IsPCloud(link)) dead.PCloudShareUrl = link; else dead.MediaFireShareUrl = link;
             string dkey = (dead.IsFolder ? "F:" : "f:") + MyanmarText.NormalizeKey(link);
             dead.NormalizedKey = dkey;
+            // v1.3.5: a manually deleted entry stays deleted — a dead re-resolve
+            // must not resurrect it.
+            if (entries.TryGetValue(dkey, out var prevDead) && prevDead.Status == Models.EntryStatus.Deleted)
+                return (prevDead, false);
             entries[dkey] = dead;
             return (dead, false);
         }
@@ -291,6 +313,17 @@ public sealed class LinkScanner
 
         // Unlock migration: drop the temporary password entry for this URL (replaced by the real entry below).
         entries.TryRemove("pw:" + MyanmarText.NormalizeKey(link), out _);
+
+        // v1.3.5 folder-vs-file: a single file whose base name equals an existing
+        // folder's name is part of that folder — keep the folder only. (A folder
+        // deleted by the user also blocks its file: the album was rejected.)
+        if (!resolved.IsFolder)
+        {
+            string fileBaseKey = FileBaseKey(resolved.InsideName);
+            var folder = entries.Values.FirstOrDefault(e => e.IsFolder &&
+                MyanmarText.NormalizeKey(e.DisplayName) == fileBaseKey);
+            if (folder != null) return (folder, false);
+        }
 
         string key = (resolved.IsFolder ? "F:" : "f:") + MyanmarText.NormalizeKey(resolved.InsideName);
         // Atomic check-and-add: GetOrAdd guarantees a single stored instance per key even when
@@ -351,6 +384,17 @@ public sealed class LinkScanner
                 entry.StatusText = "Ready";
             }
             entry.RefreshDerived();
+        }
+        // v1.3.5 folder-vs-file (folder arrived after the file): drop any Ready
+        // single-file entry whose base name equals this folder's name. Rows
+        // follow via SyncRows, which drops rows whose entry left _entries.
+        if (resolved.IsFolder)
+        {
+            string folderNameKey = MyanmarText.NormalizeKey(resolved.InsideName);
+            foreach (var f in entries.Values.Where(e => !e.IsFolder &&
+                         e.Status == Models.EntryStatus.Ready &&
+                         FileBaseKey(e.DisplayName) == folderNameKey).ToList())
+                entries.TryRemove(f.NormalizedKey, out _);
         }
         return (entry, isNew);
     }

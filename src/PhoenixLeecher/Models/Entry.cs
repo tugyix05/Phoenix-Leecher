@@ -13,6 +13,7 @@ public enum EntryStatus
     Completed,
     Failed,
     Dead,           // share link dead after retries
+    Deleted,        // v1.3.5: manually deleted by the user — kept in _entries (hidden, persisted) so a later scan never re-adds it; never shown in _rows
 }
 
 public sealed class RemoteFile

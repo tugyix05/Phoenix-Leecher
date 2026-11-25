@@ -73,13 +73,17 @@ public partial class MainWindow : Window
             {
                 _byId[kv.Value.Id] = kv.Value;
                 // User spec 2026-10-17: don't show Completed in the visible list.
-                if (kv.Value.Status != EntryStatus.Completed)
+                // v1.3.5: Deleted entries are never shown either.
+                // v1.3.5: Dead entries are never shown either (user: don't include Dead in scans).
+                if (kv.Value.Status != EntryStatus.Completed && kv.Value.Status != EntryStatus.Deleted && kv.Value.Status != EntryStatus.Dead)
                     _rows.Add(kv.Value);
             }
         }
-        // removals
+        // removals: a row whose entry left _entries (v1.3.5 folder-vs-file
+        // suppression removes the file entry from _entries) must leave _rows too.
+        var liveIds = new HashSet<string>(_entries.Values.Select(e => e.Id));
         for (int i = _rows.Count - 1; i >= 0; i--)
-            if (!_byId.ContainsKey(_rows[i].Id))
+            if (!_byId.ContainsKey(_rows[i].Id) || !liveIds.Contains(_rows[i].Id))
             {
                 _byId.Remove(_rows[i].Id);
                 _rows.RemoveAt(i);
@@ -108,6 +112,15 @@ public partial class MainWindow : Window
     private void ApplyTick(EntryTick t)
     {
         if (!_byId.TryGetValue(t.EntryId, out var e)) return;
+        // v1.3.5: a Deleted entry never changes status again — but a late tick
+        // from a download cancelled by the delete must still release its CTS,
+        // or ChangeFolder would stay blocked on a dead download.
+        if (e.Status == EntryStatus.Deleted)
+        {
+            if (t.Status is EntryStatus.Completed or EntryStatus.Failed or EntryStatus.Paused)
+                if (_dlCts.Remove(t.EntryId, out var deadCts)) deadCts.Dispose();
+            return;
+        }
         e.Status = t.Status;
         e.DownloadedBytes = t.DownloadedBytes;
         e.Progress = t.Progress;
@@ -184,7 +197,12 @@ public partial class MainWindow : Window
         // pCloud/MediaFire share link, resolve it directly instead of fetching as a page.
         if (LinkScanner.IsShareLink(url))
         {
-            var (_, isNew) = await Task.Run(() => _scanner.ResolveAndAddAsync(url, _entries, null, CancellationToken.None));
+            var (entry, isNew) = await Task.Run(() => _scanner.ResolveAndAddAsync(url, _entries, null, CancellationToken.None));
+            // v1.3.5: Dead entries are never listed — but a directly pasted dead
+            // link still gets its "Link dead" feedback here.
+            if (entry.Status == EntryStatus.Dead)
+                MessageBox.Show("Link dead: " + url, "Phoenix Leecher",
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
             SyncRows();
             return isNew ? 1 : 0;
         }
@@ -379,11 +397,15 @@ public partial class MainWindow : Window
     private void RemoveEntry(LeecherEntry entry)
     {
         if (_dlCts.TryGetValue(entry.Id, out var cts)) cts.Cancel();
-        // Completed: keep in _entries for dedup (never reappear in scans),
-        // remove from UI (_rows/_byId) only. Non-completed: remove fully.
-        if (entry.Status != EntryStatus.Completed)
-            _entries.TryRemove(entry.NormalizedKey, out _);
-        _byId.Remove(entry.Id);
+        // v1.3.5: a manual delete is remembered — the entry stays in _entries
+        // as Deleted (hidden, persisted), so a later scan never re-adds it.
+        // Completed already behaved this way (kept in _entries for dedup).
+        // Dead entries are never listed (user: don't include Dead in scans),
+        // so there is no Dead row to delete — no exception is needed here.
+        entry.Status = EntryStatus.Deleted;
+        entry.StatusText = "Deleted";
+        // Keep _entries + _byId: late ticks from the cancelled download are
+        // swallowed by the ApplyTick Deleted guard (which releases the CTS).
         _rows.Remove(entry);
         _passwords.Remove(entry.Id);
         SaveEntries();
@@ -393,13 +415,25 @@ public partial class MainWindow : Window
     private void RowDelete_Click(object sender, RoutedEventArgs e)
     {
         if ((sender as FrameworkElement)?.DataContext is LeecherEntry entry)
+        {
+            // v1.3.5: deleting is permanent (no Restore) — confirm first.
+            if (MessageBox.Show($"Delete '{entry.DisplayName}'?\n\nIt will not appear in future scans.",
+                    "Phoenix Leecher", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+                return;
             RemoveEntry(entry);
+        }
     }
 
     private void DeleteSelected_Click(object sender, RoutedEventArgs e)
     {
         if (Grid.SelectedItem is LeecherEntry entry)
+        {
+            // v1.3.5: deleting is permanent (no Restore) — confirm first.
+            if (MessageBox.Show($"Delete '{entry.DisplayName}'?\n\nIt will not appear in future scans.",
+                    "Phoenix Leecher", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+                return;
             RemoveEntry(entry);
+        }
     }
 
     private void RemoveCompleted_Click(object sender, RoutedEventArgs e)
@@ -577,10 +611,12 @@ public partial class MainWindow : Window
             }).ToList();
             // Also persist hidden Completed (in _entries but not in _rows, per user spec
             // 2026-10-17) so dedup survives restart and Whole scan doesn't re-add them.
+            // v1.3.5: same for Deleted entries (manual deletes must survive restart).
+            // v1.3.5: same for Dead entries (hidden, but kept so scans skip re-resolving them).
             var visibleIds = new HashSet<string>(_rows.Select(e => e.Id));
             foreach (var kv in _entries.Values)
             {
-                if (kv.Status == EntryStatus.Completed && !visibleIds.Contains(kv.Id))
+                if ((kv.Status == EntryStatus.Completed || kv.Status == EntryStatus.Deleted || kv.Status == EntryStatus.Dead) && !visibleIds.Contains(kv.Id))
                 {
                     list.Add(new SavedEntry
                     {
@@ -614,7 +650,7 @@ public partial class MainWindow : Window
             {
                 // Mid-resolve entries (no files yet) can't download; user re-scans.
                 // Dead / NeedsPassword are link states, kept without files.
-                if (s.Files.Count == 0 && s.Status != "Dead" && s.Status != "NeedsPassword")
+                if (s.Files.Count == 0 && s.Status != "Dead" && s.Status != "NeedsPassword" && s.Status != "Deleted")
                     continue;
                 var entry = new LeecherEntry
                 {
@@ -638,6 +674,7 @@ public partial class MainWindow : Window
                     "Failed" => EntryStatus.Failed,
                     "Dead" => EntryStatus.Dead,
                     "NeedsPassword" => EntryStatus.NeedsPassword,
+                    "Deleted" => EntryStatus.Deleted,
                     _ => EntryStatus.Ready,
                 };
                 entry.StatusText = entry.Status switch
@@ -647,6 +684,7 @@ public partial class MainWindow : Window
                     EntryStatus.Dead => "Link dead",
                     EntryStatus.NeedsPassword => "Password required",
                     EntryStatus.Paused => "Paused",
+                    EntryStatus.Deleted => "Deleted",
                     _ => "Ready",
                 };
                 // User spec 2026-11-08: progress comes from json, no disk scan.
@@ -668,7 +706,7 @@ public partial class MainWindow : Window
             {
                 _entries[entry.NormalizedKey] = entry;
                 _byId[entry.Id] = entry;
-                if (entry.Status != EntryStatus.Completed)
+                if (entry.Status != EntryStatus.Completed && entry.Status != EntryStatus.Deleted && entry.Status != EntryStatus.Dead)
                     _rows.Add(entry);
             }
             RenumberRows();
