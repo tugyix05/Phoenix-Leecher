@@ -288,7 +288,7 @@ public sealed class LinkScanner
     // Returns true if it created a new album. Resolve errors are already
     // swallowed inside ResolveAndAddAsync (dead entry); only cancellation
     // escapes, which aborts the scan like the old sequential loop did.
-    private static async Task<bool> ResolveOneAsync(
+    private async Task<bool> ResolveOneAsync(
         string link, ConcurrentDictionary<string, LeecherEntry> entries,
         SemaphoreSlim gate, CancellationToken ct)
     {
