@@ -35,6 +35,7 @@
                     <MenuItem Header="1" Click="Concurrency_Click" Tag="1"/>
                     <MenuItem Header="2" Click="Concurrency_Click" Tag="2"/>
                     <MenuItem Header="3" Click="Concurrency_Click" Tag="3" IsChecked="True"/>
+                    <MenuItem Header="4" Click="Concurrency_Click" Tag="4"/>
                     <MenuItem Header="5" Click="Concurrency_Click" Tag="5"/>
                 </MenuItem>
             </MenuItem>
@@ -91,6 +92,18 @@
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="&#xE769;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center" Margin="0,0,6,0"/>
                         <TextBlock Text="Pause All" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Button>
+                <TextBox x:Name="ScanCountBox" Width="52" Margin="6,2,2,2" Text="50"
+                         Background="{DynamicResource InputBackground}" Foreground="{DynamicResource TextBrush}"
+                         BorderBrush="{DynamicResource BorderStrongBrush}"
+                         VerticalContentAlignment="Center" Padding="6,4"
+                         ToolTip="How many albums to scan for in Scan &amp; Download"/>
+                <Button Click="ScanDownload_Click" Margin="2" Padding="8,4"
+                        Style="{StaticResource FlatButton}" ToolTip="Scan for new albums and download each one as soon as it is found">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE896;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBlock Text="Scan &amp; Download" VerticalAlignment="Center"/>
                     </StackPanel>
                 </Button>
                 <Border Width="1" Background="{DynamicResource BorderBrush}" Margin="8,6"/>

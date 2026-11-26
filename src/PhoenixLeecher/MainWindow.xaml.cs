@@ -28,9 +28,14 @@ public partial class MainWindow : Window
     private DownloadEngine _engine = new(maxConcurrentFiles: 3);
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _dlBatchCts; // Download All batch token; Pause All cancels it too
+    private CancellationTokenSource? _pipeCts; // Scan & Download pipeline token (same object as _dlBatchCts while running)
     private bool _scanRunning;
     private static string EntriesPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhoenixLeecher", "entries.json");
+    // v1.3.7: the list lives in SQLite now (entries.db); entries.json is only
+    // the one-time migration source, kept afterwards as entries.json.bak.
+    private static string DbPath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhoenixLeecher", "entries.db");
     private readonly IProgress<EntryTick> _tickProgress;
     private readonly IProgress<ScanProgress> _scanProgress;
     private readonly DispatcherTimer _syncTimer = new();
@@ -245,38 +250,8 @@ public partial class MainWindow : Window
         _lastScanSavedCount = 0;
         try
         {
-            // Run model (user spec 2026-10-16):
-            // - Fresh: page links first (counted), then older-posts crawl to 50 NEW albums.
-            // - Stopped early (AlbumsFound in 1..49): resume from saved cursor, no page re-scrape.
-            // - Target reached (previous run hit 50): NEW run — cursor preserved, counter reset,
-            //   next 50 NEW albums; already-seen links are not re-counted (dedup).
-            var saved = _scanner.LoadState(url);
-            bool isBlog = LinkScanner.IsBlogspot(url);
-            bool targetReached = saved != null && saved.AlbumsFound >= LinkScanner.LinkTarget;
-            bool isResume = saved != null && !targetReached && saved.AlbumsFound > 0 && isBlog;
-
-            if (targetReached)
-            {
-                // Previous run completed 50: reset counter, keep cursor for the next 50.
-                saved!.AlbumsFound = 0;
-                _scanner.SaveState(saved);
-                isResume = true; // skip page re-scrape, continue from cursor
-            }
-
-            if (!isResume)
-            {
-                int pageAlbums = await DoFindLinksAsync();
-                // Seed the run counter with page albums so the feed crawl continues toward 50.
-                var s = _scanner.LoadState(url) ?? new ScanState { BlogUrl = url };
-                s.AlbumsFound = pageAlbums;
-                s.StartIndex = 1;
-                _scanner.SaveState(s);
-            }
-
-            _scanCts = new CancellationTokenSource();
-            StopBtn.IsEnabled = true;
-            ScanStrip.Visibility = Visibility.Visible;
-            await Task.Run(() => _scanner.ScanAsync(url, _entries, _scanProgress, _scanCts.Token));
+            var scanTask = await BeginWholeScanAsync(url, LinkScanner.LinkTarget);
+            await scanTask;
         }
         catch (OperationCanceledException) { /* Stop pressed: state already saved */ }
         catch (Exception ex)
@@ -290,6 +265,125 @@ public partial class MainWindow : Window
             SaveEntries();
             _scanCts?.Dispose();
             _scanCts = null;
+            SetScanRunning(false);
+        }
+    }
+
+    // Starts a Whole scan (page links first, then feed crawl to <target> NEW
+    // albums) and returns the running scan task. The caller awaits it and owns
+    // the try/catch/finally (SyncRows/SaveEntries/dispose/SetScanRunning).
+    // Run model (user spec 2026-10-16):
+    // - Fresh: page links first (counted), then older-posts crawl to <target> NEW albums.
+    // - Stopped early: resume from saved cursor, no page re-scrape.
+    // - Target reached: NEW run — cursor preserved, counter reset, next <target>
+    //   NEW albums; already-seen links are not re-counted (dedup).
+    private async Task<Task> BeginWholeScanAsync(string url, int target)
+    {
+        var saved = _scanner.LoadState(url);
+        bool isBlog = LinkScanner.IsBlogspot(url);
+        bool targetReached = saved != null && saved.AlbumsFound >= LinkScanner.LinkTarget;
+        bool isResume = saved != null && !targetReached && saved.AlbumsFound > 0 && isBlog;
+
+        if (targetReached)
+        {
+            // Previous run completed 50: reset counter, keep cursor for the next run.
+            saved!.AlbumsFound = 0;
+            _scanner.SaveState(saved);
+            isResume = true; // skip page re-scrape, continue from cursor
+        }
+
+        if (!isResume)
+        {
+            int pageAlbums = await DoFindLinksAsync();
+            // Seed the run counter with page albums so the feed crawl continues toward the target.
+            var s = _scanner.LoadState(url) ?? new ScanState { BlogUrl = url };
+            s.AlbumsFound = pageAlbums;
+            s.StartIndex = 1;
+            _scanner.SaveState(s);
+        }
+
+        _scanCts = new CancellationTokenSource();
+        StopBtn.IsEnabled = true;
+        ScanStrip.Visibility = Visibility.Visible;
+        return Task.Run(() => _scanner.ScanAsync(url, _entries, _scanProgress, _scanCts.Token, target));
+    }
+
+    // ---------- Scan & Download (user spec 2026-11-26) ----------
+    // The number field is how many NEW albums to scan for. Pressing the button
+    // scans first and downloads each album as soon as it is found — scan and
+    // download run at the same time (pipelined), downloads N at a time per
+    // Max concurrent. Stop ends the scan (no new downloads); Pause All ends
+    // everything. NOTE: pressing Download All mid-pipeline cancels this batch
+    // token and stops the scan — Download All then takes over the downloads.
+    private async void ScanDownload_Click(object sender, RoutedEventArgs e)
+    {
+        if (_scanRunning || _isBatchRunning) return;
+        string url = CurrentUrl; // capture on UI thread
+        if (string.IsNullOrWhiteSpace(url)) return;
+        if (!int.TryParse(ScanCountBox.Text.Trim(), out int target) || target < 1) target = 50;
+        if (target > 1000) target = 1000; // safety bound: the feed is finite, a runaway target scans forever
+        SetScanRunning(true);
+        _lastScanSavedCount = 0;
+        _pipeCts = new CancellationTokenSource();
+        _dlBatchCts = _pipeCts; // Pause All cancels this: stops the feeder and the downloads
+        _isBatchRunning = true;
+        // Only download what THIS scan finds — rows already sitting in the list
+        // before the button was pressed are left alone (Download All is for those).
+        var knownIds = new HashSet<string>(_rows.Select(e => e.Id));
+        Task? scanTask = null;
+        try
+        {
+            scanTask = await BeginWholeScanAsync(url, target);
+            while (true)
+            {
+                _pipeCts.Token.ThrowIfCancellationRequested();
+                if (_scanCts?.IsCancellationRequested == true) break; // Stop pressed: no new downloads
+                // Feed: start Ready entries while a download slot is free.
+                foreach (var entry in _rows.Where(x => x.Status == EntryStatus.Ready && !knownIds.Contains(x.Id)).ToList())
+                {
+                    if (_dlTasks.Count >= _engine.MaxConcurrentFiles) break;
+                    _pipeCts.Token.ThrowIfCancellationRequested();
+                    StartDownloadNow(entry); // false if already running / needs password — skip silently
+                }
+                if (scanTask.IsCompleted && _dlTasks.Count == 0) break;
+                // When the scan is done but downloads remain, wait on the delay
+                // alone — WhenAny with an already-completed scan task would return
+                // at once and spin this loop with no pause.
+                if (scanTask.IsCompleted)
+                    await Task.Delay(500, _pipeCts.Token);
+                else
+                    await Task.WhenAny(scanTask, Task.Delay(500, _pipeCts.Token));
+            }
+            await scanTask; // surface scan errors
+        }
+        catch (OperationCanceledException) { _scanCts?.Cancel(); /* Pause/Stop pressed */ }
+        catch (Exception ex)
+        {
+            _scanCts?.Cancel();
+            MessageBox.Show("Scan & Download failed: " + ex.Message, "Phoenix Leecher",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+        finally
+        {
+            if (scanTask != null)
+            {
+                try { await scanTask; } catch { /* already reported, or cancelled */ }
+            }
+            SyncRows();
+            SaveEntries();
+            _scanCts?.Dispose();
+            _scanCts = null;
+            var pipe = _pipeCts;
+            if (_dlBatchCts == pipe) _dlBatchCts = null; // don't clobber a Download All batch started mid-pipeline
+            pipe?.Dispose();
+            _pipeCts = null;
+            _isBatchRunning = false;
+            // Batch summary: albums where BOTH pCloud and MediaFire failed.
+            List<string> failed;
+            lock (_bothFailedNames) { failed = new List<string>(_bothFailedNames); _bothFailedNames.Clear(); }
+            if (failed.Count > 0)
+                MessageBox.Show("These albums failed on both pCloud and MediaFire:\n- " + string.Join("\n- ", failed),
+                    "Phoenix Leecher", MessageBoxButton.OK, MessageBoxImage.Warning);
             SetScanRunning(false);
         }
     }
@@ -356,16 +450,34 @@ public partial class MainWindow : Window
         try
         {
             var list = _rows.Where(x => x.Status is EntryStatus.Ready or EntryStatus.Paused or EntryStatus.Failed).ToList();
+            // v1.3.7: Download All runs up to N albums at once (N = Options ->
+            // Max concurrent files, the IDM-style number the user picks). The
+            // engine's file-slot pool is the same N, so N single-file albums
+            // transfer N files at once; multi-file folders share the pool.
+            var running = new List<Task>();
             foreach (var entry in list)
             {
                 batchCts.Token.ThrowIfCancellationRequested();
+                while (running.Count >= _engine.MaxConcurrentFiles)
+                {
+                    await Task.WhenAny(running.Concat(new[] { Task.Delay(Timeout.Infinite, batchCts.Token) }));
+                    running.RemoveAll(t => t.IsCompleted);
+                    batchCts.Token.ThrowIfCancellationRequested(); // Pause All while waiting for a slot
+                }
                 // Start on the UI thread; skip if not started (already running / needs password).
                 bool started = (bool)Dispatcher.Invoke(() => StartDownloadNow(entry));
                 if (!started) continue;
-                // Wait for this entry's download task (or batch cancel) — no polling.
                 if (_dlTasks.TryGetValue(entry.Id, out var task))
-                    await Task.WhenAny(task, Task.Delay(Timeout.Infinite, batchCts.Token));
+                    running.Add(task);
             }
+            // Wait for the stragglers (or batch cancel) — no polling.
+            if (running.Count > 0)
+            {
+                var all = Task.WhenAll(running);
+                await Task.WhenAny(all, Task.Delay(Timeout.Infinite, batchCts.Token));
+                _ = all.Exception; // observe: per-entry failures are already reported, never throw here
+            }
+            batchCts.Token.ThrowIfCancellationRequested();
         }
         catch (OperationCanceledException) { /* Pause All pressed */ }
         finally
@@ -574,21 +686,7 @@ public partial class MainWindow : Window
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
 
     // ---------- entry list persistence (user spec: list survives app restart) ----------
-    private sealed class SavedEntry
-    {
-        public string NormalizedKey { get; set; } = "";
-        public string DisplayName { get; set; } = "";
-        public bool IsFolder { get; set; }
-        public long TotalSize { get; set; }
-        public string PrimaryHost { get; set; } = "pcloud";
-        public string? PCloudShareUrl { get; set; }
-        public string? MediaFireShareUrl { get; set; }
-        public string Status { get; set; } = "Ready";
-        // User spec 2026-11-08: progress comes from json, not from a disk
-        // scan — the exact names + this byte count are the source of truth.
-        public long DownloadedBytes { get; set; }
-        public List<RemoteFile> Files { get; set; } = new();
-    }
+    // v1.3.7: SavedEntry now lives in Models/Entry.cs; EntryStore (SQLite) reads/writes it.
 
     private void SaveEntries()
     {
@@ -633,7 +731,7 @@ public partial class MainWindow : Window
                     });
                 }
             }
-            File.WriteAllText(EntriesPath, JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+            new EntryStore(DbPath).SaveAll(list);
         }
         catch { /* persistence must never break the app */ }
     }
@@ -642,8 +740,36 @@ public partial class MainWindow : Window
     {
         try
         {
-            if (!File.Exists(EntriesPath)) return;
-            var list = JsonSerializer.Deserialize<List<SavedEntry>>(File.ReadAllText(EntriesPath));
+            // v1.3.7: the list lives in SQLite (entries.db) now, indexed on
+            // NormalizedKey. First run after the upgrade imports entries.json
+            // once, then keeps it as entries.json.bak (never deleted).
+            // If the DB can't be read, fall back to the JSON files.
+            List<SavedEntry>? list = null;
+            var store = new EntryStore(DbPath);
+            try
+            {
+                if (store.DatabaseExists)
+                {
+                    list = store.LoadAll();
+                }
+                else if (File.Exists(EntriesPath))
+                {
+                    list = JsonSerializer.Deserialize<List<SavedEntry>>(File.ReadAllText(EntriesPath));
+                    if (list != null)
+                    {
+                        store.SaveAll(list); // succeeds first — only then the JSON is retired
+                        File.Move(EntriesPath, EntriesPath + ".bak", overwrite: true);
+                    }
+                }
+            }
+            catch
+            {
+                // DB unreadable (e.g. native lib missing) — fall back to JSON.
+                if (File.Exists(EntriesPath))
+                    list = JsonSerializer.Deserialize<List<SavedEntry>>(File.ReadAllText(EntriesPath));
+                else if (File.Exists(EntriesPath + ".bak"))
+                    list = JsonSerializer.Deserialize<List<SavedEntry>>(File.ReadAllText(EntriesPath + ".bak"));
+            }
             if (list == null) return;
             var rebuilt = new List<LeecherEntry>();
             foreach (var s in list)

@@ -24,6 +24,11 @@ public sealed class ScanState
     public int AlbumsFound { get; set; }  // albums found in the current run (reset per run)
     public int PostsDone { get; set; }
     public DateTime SavedAt { get; set; }
+    // v1.3.7 incremental scan: post id -> last-seen updated timestamp.
+    // A post whose (id, updated) matches is skipped entirely on later scans
+    // (its links were already resolved). New posts (unknown id) and edited
+    // posts (new updated) are processed, so new files are still found.
+    public Dictionary<string, string> PostUpdated { get; set; } = new();
 }
 
 /// <summary>
@@ -137,10 +142,10 @@ public sealed class LinkScanner
         string blogUrl,
         ConcurrentDictionary<string, LeecherEntry> entries,
         IProgress<ScanProgress> progress,
-        CancellationToken ct)
+        CancellationToken ct, int target = LinkTarget)
     {
         var state = LoadState(blogUrl) ?? new ScanState { BlogUrl = blogUrl };
-        var prog = new ScanProgress { AlbumsFound = state.AlbumsFound, Target = LinkTarget, PostsDone = state.PostsDone, Running = true };
+        var prog = new ScanProgress { AlbumsFound = state.AlbumsFound, Target = target, PostsDone = state.PostsDone, Running = true };
 
         try
         {
@@ -156,13 +161,13 @@ public sealed class LinkScanner
                         prog.AlbumsFound++;
                         progress.Report(prog);
                     }
-                    if (prog.AlbumsFound >= LinkTarget) break;
+                    if (prog.AlbumsFound >= target) break;
                 }
                 return;
             }
 
             int startIndex = state.StartIndex;
-            while (prog.AlbumsFound < LinkTarget)
+            while (prog.AlbumsFound < target)
             {
                 ct.ThrowIfCancellationRequested();
                 var feedUrl = $"{NormalizeBlogUrl(blogUrl)}/feeds/posts/default?alt=json&max-results=150&start-index={startIndex}";
@@ -191,31 +196,64 @@ public sealed class LinkScanner
                 if (!feed.TryGetProperty("entry", out var postEntries) || postEntries.GetArrayLength() == 0)
                     break; // exhausted
 
-                int postsDoneInPage = 0;
+                // v1.3.7 incremental scan: collect this page's links, skipping
+                // posts whose (id, updated) matches the stored map. A NEW post
+                // (unknown id) or an EDITED post (new updated) is processed, so
+                // new files are still found on every scan. First run after the
+                // upgrade has an empty map and walks the feed once to build it.
+                var batchLinks = new List<string>();
+                int pageCount = 0;
                 foreach (var e in postEntries.EnumerateArray())
                 {
-                    ct.ThrowIfCancellationRequested();
+                    pageCount++;
+                    string postId = e.TryGetProperty("id", out var idEl) &&
+                                    idEl.TryGetProperty("$t", out var idStr)
+                        ? idStr.GetString() ?? "" : "";
+                    string updated = e.TryGetProperty("updated", out var upEl) &&
+                                     upEl.TryGetProperty("$t", out var upStr)
+                        ? upStr.GetString() ?? "" : "";
+                    if (postId.Length > 0 && updated.Length > 0 &&
+                        state.PostUpdated.TryGetValue(postId, out var seen) && seen == updated)
+                        continue; // unchanged post — its links were already resolved
+                    if (postId.Length > 0 && updated.Length > 0)
+                        state.PostUpdated[postId] = updated;
                     string content = e.TryGetProperty("content", out var c) ? c.GetProperty("$t").GetString() ?? "" : "";
-                    int albumsThisPost = 0;
-                    foreach (var link in ExtractLinks(content))
-                    {
-                        if (prog.AlbumsFound + albumsThisPost >= LinkTarget) break;
-                        ct.ThrowIfCancellationRequested();
-                        var (_, isNew) = await ResolveAndAddAsync(link, entries, null, ct);
-                        if (isNew) albumsThisPost++;
-                    }
-                    // Commit per post: exact resume cursor, no double-count if stopped mid-post.
-                    prog.AlbumsFound += albumsThisPost;
-                    prog.PostsDone++;
-                    postsDoneInPage++;
-                    state.StartIndex = startIndex + postsDoneInPage;
-                    state.AlbumsFound = prog.AlbumsFound;
-                    state.PostsDone = prog.PostsDone;
-                    state.SavedAt = DateTime.Now;
-                    SaveState(state); // resumable across app restart, after every post
-                    progress.Report(prog);
-                    if (prog.AlbumsFound >= LinkTarget) break;
+                    batchLinks.AddRange(ExtractLinks(content));
                 }
+                // v1.3.7 parallel scan: resolve up to 8 links at once (was 1 by 1,
+                // so one dead link's ~31 s of retries blocked every link behind
+                // it). Retry stays 6 (inside HttpRetry). Launching stops as soon
+                // as the target is reached; in-flight resolves may overshoot by a few.
+                int baseFound = prog.AlbumsFound;
+                int newAlbums = 0;
+                var gate = new SemaphoreSlim(8, 8);
+                var tasks = new List<Task>();
+                async Task RunOneAsync(string link)
+                {
+                    if (await ResolveOneAsync(link, entries, gate, ct))
+                    {
+                        int n = Interlocked.Increment(ref newAlbums);
+                        prog.AlbumsFound = baseFound + n; // live counter for the UI
+                        progress.Report(prog);
+                    }
+                }
+                foreach (var link in batchLinks)
+                {
+                    if (baseFound + Volatile.Read(ref newAlbums) >= target)
+                        break; // stop launching once the target is reached
+                    ct.ThrowIfCancellationRequested();
+                    tasks.Add(RunOneAsync(link));
+                }
+                await Task.WhenAll(tasks);
+                // Commit per page: exact resume cursor, no double-count if stopped mid-page.
+                prog.AlbumsFound = baseFound + newAlbums;
+                prog.PostsDone += pageCount;
+                state.StartIndex = startIndex + pageCount;
+                state.AlbumsFound = prog.AlbumsFound;
+                state.PostsDone = prog.PostsDone;
+                state.SavedAt = DateTime.Now;
+                SaveState(state); // resumable across app restart, once per 150-post page (was per post)
+                progress.Report(prog);
 
                 startIndex = state.StartIndex; // follow the exact cursor (page may be partial)
             }
@@ -225,10 +263,10 @@ public sealed class LinkScanner
             // Graceful halt: always persist latest position (Stop or target reached).
             state.PostsDone = prog.PostsDone;
             state.SavedAt = DateTime.Now;
-            if (prog.AlbumsFound >= LinkTarget)
+            if (prog.AlbumsFound >= target)
             {
-                // Target reached: preserve the feed cursor for the NEXT 50,
-                // reset the run counter (next Whole scan starts a fresh count).
+                // Target reached: preserve the feed cursor for the NEXT run,
+                // reset the run counter (next scan starts a fresh count).
                 state.AlbumsFound = 0;
             }
             else
@@ -237,7 +275,7 @@ public sealed class LinkScanner
             }
             SaveState(state);
             prog.Running = false;
-            prog.Note = prog.AlbumsFound >= LinkTarget ? "target reached" : "stopped";
+            prog.Note = prog.AlbumsFound >= target ? "target reached" : "stopped";
             progress.Report(prog);
         }
     }
@@ -246,6 +284,23 @@ public sealed class LinkScanner
     /// Resolve one share link and merge into entries (dedup). Throws nothing: dead links are marked.
     /// Returns the entry and whether it is a NEW unique album (false for duplicates, dead, password).
     /// </summary>
+    // v1.3.7 parallel scan worker: resolve one link under the 8-way gate.
+    // Returns true if it created a new album. Resolve errors are already
+    // swallowed inside ResolveAndAddAsync (dead entry); only cancellation
+    // escapes, which aborts the scan like the old sequential loop did.
+    private static async Task<bool> ResolveOneAsync(
+        string link, ConcurrentDictionary<string, LeecherEntry> entries,
+        SemaphoreSlim gate, CancellationToken ct)
+    {
+        await gate.WaitAsync(ct);
+        try
+        {
+            var (_, isNew) = await ResolveAndAddAsync(link, entries, null, ct);
+            return isNew;
+        }
+        finally { gate.Release(); }
+    }
+
     public async Task<(LeecherEntry Entry, bool IsNew)> ResolveAndAddAsync(
         string link, ConcurrentDictionary<string, LeecherEntry> entries, string? password, CancellationToken ct)
     {

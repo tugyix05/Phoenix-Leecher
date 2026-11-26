@@ -101,3 +101,20 @@ public sealed class LeecherEntry : INotifyPropertyChanged
             handler(this, new PropertyChangedEventArgs(name));
     }
 }
+
+/// <summary>Stored form of one entry (v1.3.7: one SQLite row in EntryStore).
+/// Progress comes from the stored byte count, not from a disk scan — the exact
+/// names + this byte count are the source of truth (user spec 2026-11-08).</summary>
+internal sealed class SavedEntry
+{
+    public string NormalizedKey { get; set; } = "";
+    public string DisplayName { get; set; } = "";
+    public bool IsFolder { get; set; }
+    public long TotalSize { get; set; }
+    public string PrimaryHost { get; set; } = "pcloud";
+    public string? PCloudShareUrl { get; set; }
+    public string? MediaFireShareUrl { get; set; }
+    public string Status { get; set; } = "Ready";
+    public long DownloadedBytes { get; set; }
+    public List<RemoteFile> Files { get; set; } = new();
+}
