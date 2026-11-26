@@ -29,6 +29,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _dlBatchCts; // Download All batch token; Pause All cancels it too
     private CancellationTokenSource? _pipeCts; // Scan & Download pipeline token (same object as _dlBatchCts while running)
+    private bool _pipeIsResume; // set by BeginWholeScanAsync: this press resumes an earlier run (user spec 2026-11-26)
     private bool _scanRunning;
     private static string EntriesPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PhoenixLeecher", "entries.json");
@@ -281,12 +282,12 @@ public partial class MainWindow : Window
     {
         var saved = _scanner.LoadState(url);
         bool isBlog = LinkScanner.IsBlogspot(url);
-        bool targetReached = saved != null && saved.AlbumsFound >= LinkScanner.LinkTarget;
+        bool targetReached = saved != null && saved.AlbumsFound >= target;
         bool isResume = saved != null && !targetReached && saved.AlbumsFound > 0 && isBlog;
 
         if (targetReached)
         {
-            // Previous run completed 50: reset counter, keep cursor for the next run.
+            // Previous run completed <target>: reset counter, keep cursor for the next run.
             saved!.AlbumsFound = 0;
             _scanner.SaveState(saved);
             isResume = true; // skip page re-scrape, continue from cursor
@@ -302,6 +303,7 @@ public partial class MainWindow : Window
             _scanner.SaveState(s);
         }
 
+        _pipeIsResume = isResume; // Scan & Download feeder reads this: a resumed run downloads all Ready rows
         _scanCts = new CancellationTokenSource();
         StopBtn.IsEnabled = true;
         ScanStrip.Visibility = Visibility.Visible;
@@ -315,6 +317,9 @@ public partial class MainWindow : Window
     // Max concurrent. Stop ends the scan (no new downloads); Pause All ends
     // everything. NOTE: pressing Download All mid-pipeline cancels this batch
     // token and stops the scan — Download All then takes over the downloads.
+    // Re-press (user spec 2026-11-26): pressing again while a run is stopped
+    // resumes the SAME run — scan continues from the saved cursor to the field's
+    // number, and the feeder downloads the unfinished Ready rows too.
     private async void ScanDownload_Click(object sender, RoutedEventArgs e)
     {
         if (_scanRunning || _isBatchRunning) return;
@@ -327,8 +332,11 @@ public partial class MainWindow : Window
         _pipeCts = new CancellationTokenSource();
         _dlBatchCts = _pipeCts; // Pause All cancels this: stops the feeder and the downloads
         _isBatchRunning = true;
-        // Only download what THIS scan finds — rows already sitting in the list
-        // before the button was pressed are left alone (Download All is for those).
+        // Fresh press: only download what THIS scan finds — rows already sitting
+        // in the list before the button was pressed are left alone (Download All
+        // is for those). Re-press (resume, user spec 2026-11-26): the feeder also
+        // downloads the unfinished Ready rows the earlier run left behind —
+        // nothing is left behind.
         var knownIds = new HashSet<string>(_rows.Select(e => e.Id));
         Task? scanTask = null;
         try
@@ -339,7 +347,7 @@ public partial class MainWindow : Window
                 _pipeCts.Token.ThrowIfCancellationRequested();
                 if (_scanCts?.IsCancellationRequested == true) break; // Stop pressed: no new downloads
                 // Feed: start Ready entries while a download slot is free.
-                foreach (var entry in _rows.Where(x => x.Status == EntryStatus.Ready && !knownIds.Contains(x.Id)).ToList())
+                foreach (var entry in _rows.Where(x => x.Status == EntryStatus.Ready && (_pipeIsResume || !knownIds.Contains(x.Id))).ToList())
                 {
                     if (_dlTasks.Count >= _engine.MaxConcurrentFiles) break;
                     _pipeCts.Token.ThrowIfCancellationRequested();
