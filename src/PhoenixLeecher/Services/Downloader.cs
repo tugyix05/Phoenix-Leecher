@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -31,6 +33,11 @@ public sealed class EntryTick
 /// - Pause/Resume per entry via HTTP Range (.part files).
 /// - Expired/dead direct URL (403/401/410) -> auto re-resolve fresh URL, resume from offset.
 /// - pCloud broken -> auto fallback to MediaFire backup (re-resolve + continue same files).
+/// - v1.3.9: pCloud resolve failure (stale/empty fileid, API error) -> MediaFire per file;
+///   a file with an empty fileid skips pCloud entirely. A file unresolvable on both
+///   hosts is skipped and the album falls back to a whole-folder ZIP (getpubzip,
+///   code only, no fileid) — that also recovers subfolder contents, which have
+///   no fileid by nature and can never download per-file.
 /// - Folder = 1 entry: all files into &lt;DownloadRoot&gt;\&lt;folder&gt;\.
 /// </summary>
 public sealed class DownloadEngine
@@ -127,16 +134,33 @@ public sealed class DownloadEngine
         }
 
         FairRegister(entry.Id);
+        // v1.3.9: files that cannot be resolved on any host (e.g. a pCloud folder
+        // entry has no fileid) are collected here instead of failing the album;
+        // after the per-file pump, the album falls back to a whole-folder ZIP.
+        var zipNeeded = new ConcurrentBag<string>();
+        bool zipTried = false;
+        Action<long> addBytes = b => { Interlocked.Add(ref totalDownloaded, b); };
+        Action maybeTick = () => { if (DateTime.UtcNow - lastTick >= TickInterval) Tick(); };
+
+        // Last-resort whole-folder ZIP (v1.3.9). Runs at most once per attempt.
+        async Task TryZipAsync()
+        {
+            zipTried = true;
+            Report(EntryStatus.Downloading, "Downloading folder as ZIP…");
+            await DownloadZipFallbackAsync(entry, targetDir, addBytes, maybeTick, ct);
+            long remain = grandTotal - totalDownloaded;
+            if (remain > 0) Interlocked.Add(ref totalDownloaded, remain);
+        }
+
         try
         {
             entry.BothLinksFailed = false; // reset per download attempt
             // Build per-file work items from the PRIMARY host.
             var work = await BuildWorkItemsAsync(entry, entry.PrimaryHost, targetDir, ct);
 
-            await PumpFilesAsync(entry, work, targetDir,
-                bytes => { Interlocked.Add(ref totalDownloaded, bytes); },
-                () => { if (DateTime.UtcNow - lastTick >= TickInterval) Tick(); },
-                ct);
+            await PumpFilesAsync(entry, work, targetDir, addBytes, maybeTick, zipNeeded, ct);
+
+            if (!zipNeeded.IsEmpty && entry.PCloudShareUrl != null) await TryZipAsync();
 
             Report(EntryStatus.Completed, "Completed");
         }
@@ -146,6 +170,27 @@ public sealed class DownloadEngine
         }
         catch (Exception ex)
         {
+            // v1.3.9: per-file path failed even after the MediaFire fallback ->
+            // one whole-folder ZIP attempt (code only, no fileid needed).
+            if (entry.PrimaryHost == "pcloud" && entry.PCloudShareUrl != null && !zipTried)
+            {
+                try
+                {
+                    await TryZipAsync();
+                    Report(EntryStatus.Completed, "Completed");
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    Report(EntryStatus.Paused, $"Paused: {Math.Min(100, totalDownloaded * 100.0 / grandTotal):F0}%");
+                    return;
+                }
+                catch (Exception zipEx)
+                {
+                    Report(EntryStatus.Failed, "Failed: " + zipEx.Message);
+                    return;
+                }
+            }
             Report(EntryStatus.Failed, entry.BothLinksFailed ? "Both links failed" : "Failed: " + ex.Message);
         }
         finally
@@ -211,28 +256,33 @@ public sealed class DownloadEngine
         }
     }
 
-    // Pump one album's files through its live fair share. A file error is
-    // rethrown at once — exactly like the old Task.WhenAll did — so the
-    // album reports Failed and the other files stop launching (in-flight
-    // files finish like before). Cancellation surfaces as Paused via the
-    // caller's catch.
+    // Pump one album's files through its live fair share. A file error stops
+    // new launches and is rethrown AFTER the in-flight files finish (v1.3.9:
+    // the ZIP fallback extracts over the same folder, so it must never race
+    // a live download) — the album then reports Failed unless the ZIP
+    // fallback recovers it. Cancellation surfaces as Paused via the caller's catch.
     private async Task PumpFilesAsync(LeecherEntry entry, List<FileWork> work, string targetDir,
-        Action<long> addBytes, Action maybeTick, CancellationToken ct)
+        Action<long> addBytes, Action maybeTick, ConcurrentBag<string> zipNeeded, CancellationToken ct)
     {
         var running = new List<Task>();
         int next = 0;
+        Exception? firstError = null;
         while (next < work.Count || running.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
-            while (next < work.Count && FairTryTake(entry.Id))
+            while (firstError == null && next < work.Count && FairTryTake(entry.Id))
             {
                 var w = work[next++];
-                var t = DownloadFileAsync(entry, w, targetDir, addBytes, maybeTick, ct);
+                var t = DownloadFileAsync(entry, w, targetDir, addBytes, maybeTick, zipNeeded, ct);
                 _ = t.ContinueWith(_ => FairRelease(entry.Id), TaskScheduler.Default);
                 running.Add(t);
             }
             if (running.Count == 0)
             {
+                // v1.3.9: a file failed -> stop launching, but let the in-flight
+                // files finish first so the ZIP fallback (which extracts over
+                // the same folder) never races a live download.
+                if (firstError != null) break;
                 // Share is 0 (more albums than slots): wait for an album to finish.
                 await Task.Delay(200, ct);
                 continue;
@@ -245,9 +295,11 @@ public sealed class DownloadEngine
                 if (!running[i].IsCompleted) continue;
                 var task = running[i];
                 running.RemoveAt(i);
-                if (task.Exception != null) throw task.Exception.InnerException ?? task.Exception;
+                if (task.Exception != null && firstError == null)
+                    firstError = task.Exception.InnerException ?? task.Exception;
             }
         }
+        if (firstError != null) throw firstError;
     }
 
     private sealed class FileWork
@@ -296,7 +348,7 @@ public sealed class DownloadEngine
     }
 
     private async Task DownloadFileAsync(LeecherEntry entry, FileWork w, string targetDir,
-        Action<long> addBytes, Action maybeTick, CancellationToken ct)
+        Action<long> addBytes, Action maybeTick, ConcurrentBag<string> zipNeeded, CancellationToken ct)
     {
         await _fileSlots.WaitAsync(ct);
         try
@@ -317,6 +369,20 @@ public sealed class DownloadEngine
             }
 
             bool fellBack = false;
+            // v1.3.9: a pCloud file with no fileid can never resolve (the API
+            // demands fileid for folder links) — try MediaFire at once; if
+            // there is no backup match, skip the file and let the album-level
+            // ZIP fallback recover it instead of failing the whole album.
+            if (entry.PrimaryHost == "pcloud" && string.IsNullOrEmpty(w.Remote.RefId))
+            {
+                if (entry.HasBackup && await TrySwapToMediaFireAsync(entry, w, targetDir, ct))
+                    fellBack = true;
+                else
+                {
+                    zipNeeded.Add(w.Remote.Name);
+                    return;
+                }
+            }
             try
             {
                 for (int attempt = 0; attempt < 3; attempt++)
@@ -332,10 +398,22 @@ public sealed class DownloadEngine
 
                     string url;
                     try { url = await w.ResolveUrl(ct); }
-                    catch (Exception) when (attempt < 2)
+                    catch (Exception)
                     {
-                        await Task.Delay(TimeSpan.FromSeconds(2 << attempt), ct);
-                        continue;
+                        // v1.3.9: resolve failed (stale/empty fileid, pCloud API
+                        // error) -> try the MediaFire backup once before retrying.
+                        if (!fellBack && entry.HasBackup && entry.PrimaryHost == "pcloud"
+                            && await TrySwapToMediaFireAsync(entry, w, targetDir, ct))
+                        {
+                            fellBack = true;
+                            continue;
+                        }
+                        if (attempt < 2)
+                        {
+                            await Task.Delay(TimeSpan.FromSeconds(2 << attempt), ct);
+                            continue;
+                        }
+                        throw;
                     }
 
                     try
@@ -428,5 +506,122 @@ public sealed class DownloadEngine
         if (!File.Exists(partPath)) return;
         if (File.Exists(finalPath)) File.Delete(finalPath);
         File.Move(partPath, finalPath);
+    }
+
+    // v1.3.9: swap one file's download URL to its MediaFire backup (re-resolve
+    // the MediaFire share live, match by normalized file name — same pattern
+    // as the stream-failure fallback). Returns false when there is no backup
+    // match or the MediaFire lookup itself fails; never throws except on
+    // cancellation, so the caller can fall through to retry / ZIP.
+    private async Task<bool> TrySwapToMediaFireAsync(LeecherEntry entry, FileWork w,
+        string targetDir, CancellationToken ct)
+    {
+        try
+        {
+            var mfWork = (await BuildWorkItemsAsync(entry, "mediafire", targetDir, ct))
+                .FirstOrDefault(x => MyanmarText.NormalizeKey(x.Remote.Name) == MyanmarText.NormalizeKey(w.Remote.Name));
+            if (mfWork == null) return false;
+            w.ResolveUrl = mfWork.ResolveUrl;
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception) { return false; }
+    }
+
+    // v1.3.9: last-resort whole-folder ZIP via pCloud getpubzip. The API needs
+    // only the link code (no fileid), so it recovers files the per-file path
+    // cannot resolve — including subfolder contents. The zip is streamed to
+    // disk (resumable .part, same as a file), verified as a real zip (an API
+    // refusal comes back as a JSON error body), extracted into the album
+    // folder skipping files already downloaded, then deleted.
+    private async Task DownloadZipFallbackAsync(LeecherEntry entry, string targetDir,
+        Action<long> addBytes, Action maybeTick, CancellationToken ct)
+    {
+        string code = ShareResolver.PCloudCodeOf(entry.PCloudShareUrl!);
+        string api = "https://api.pcloud.com/getpubzip?code=" + Uri.EscapeDataString(code);
+        if (!string.IsNullOrEmpty(entry.Password)) api += "&linkpassword=" + Uri.EscapeDataString(entry.Password);
+        string zipPath = Path.Combine(targetDir, ".phoenix-temp.zip");
+        string partPath = zipPath + ".part";
+
+        if (!File.Exists(zipPath) || !IsZipFile(zipPath))
+        {
+            if (File.Exists(zipPath)) File.Delete(zipPath); // stale non-zip (e.g. a JSON error body)
+            await _fileSlots.WaitAsync(ct);
+            try
+            {
+                long offset = File.Exists(partPath) ? new FileInfo(partPath).Length : 0;
+                long corrected = await StreamToFileAsync(api, partPath, zipPath, offset, addBytes, maybeTick, ct);
+                if (corrected < 0) addBytes(corrected);
+            }
+            finally
+            {
+                _fileSlots.Release();
+            }
+            if (!IsZipFile(zipPath))
+                throw new HttpRequestException("pCloud zip error: " + await ReadZipErrorAsync(zipPath));
+        }
+
+        ExtractZipChecked(zipPath, targetDir);
+        File.Delete(zipPath);
+    }
+
+    // Extract wrapper: a corrupt zip (right magic, bad body) must not stick
+    // around — delete it so the next attempt re-downloads instead of
+    // failing extraction forever on the same file.
+    private static void ExtractZipChecked(string zipPath, string targetDir)
+    {
+        try { ExtractZip(zipPath, targetDir); }
+        catch { try { File.Delete(zipPath); } catch { } throw; }
+    }
+
+    private static bool IsZipFile(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            byte[] head = new byte[4];
+            if (fs.Read(head, 0, 4) < 4) return false;
+            return (head[0] == (byte)'P' && head[1] == (byte)'K' && head[2] == 3 && head[3] == 4)
+                || (head[0] == (byte)'P' && head[1] == (byte)'K' && head[2] == 5 && head[3] == 6);
+        }
+        catch (Exception) { return false; }
+    }
+
+    private static async Task<string> ReadZipErrorAsync(string path)
+    {
+        try
+        {
+            if (new FileInfo(path).Length > 100_000) return "not a zip file";
+            string text = await File.ReadAllTextAsync(path);
+            if (text.Length > 500) text = text[..500];
+            return string.IsNullOrWhiteSpace(text) ? "not a zip file" : text;
+        }
+        catch (Exception ex) { return ex.Message; }
+    }
+
+    // Extract a folder zip into targetDir. getpubzip usually wraps the tree
+    // in one top-level folder — strip that single common root when every
+    // entry shares it. Skip files already on disk at the same size (they
+    // came down per-file already). Zip-slip guard: nothing escapes targetDir.
+    private static void ExtractZip(string zipPath, string targetDir)
+    {
+        using var archive = ZipFile.OpenRead(zipPath);
+        var files = archive.Entries.Where(e => !string.IsNullOrEmpty(e.Name)).ToList();
+        string? prefix = null;
+        var roots = files.Select(e => e.FullName.Split('/')[0]).Distinct().ToList();
+        if (roots.Count == 1 && files.All(e => e.FullName.Contains('/')))
+            prefix = roots[0] + "/";
+        string fullTarget = Path.GetFullPath(targetDir);
+        foreach (var e in files)
+        {
+            string rel = prefix != null && e.FullName.StartsWith(prefix, StringComparison.Ordinal)
+                ? e.FullName[prefix.Length..] : e.FullName;
+            if (string.IsNullOrEmpty(rel)) continue;
+            string dest = Path.GetFullPath(Path.Combine(targetDir, rel.Replace('/', Path.DirectorySeparatorChar)));
+            if (!dest.StartsWith(fullTarget + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) continue;
+            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+            if (File.Exists(dest) && new FileInfo(dest).Length == e.Length) continue;
+            e.ExtractToFile(dest, overwrite: true);
+        }
     }
 }
