@@ -24,6 +24,9 @@ public sealed class EntryTick
 /// Budgets: single connection per file (NO multi-segment), async streaming I/O,
 /// max 3 concurrent file downloads (user-changeable), 32KB buffer, stream-to-disk
 /// (never whole file in RAM), UI ticks throttled to 4/sec.
+/// Fair share (v1.3.8, user spec 2026-11-27): the N file slots are divided
+/// equally among the albums currently downloading — 3 slots / 3 albums = 1
+/// file each, so 3 rows progress at once; 1 album alone keeps all N slots.
 /// Behaviors:
 /// - Pause/Resume per entry via HTTP Range (.part files).
 /// - Expired/dead direct URL (403/401/410) -> auto re-resolve fresh URL, resume from offset.
@@ -37,6 +40,14 @@ public sealed class DownloadEngine
 
     private readonly SemaphoreSlim _fileSlots;
     public int MaxConcurrentFiles { get; }
+
+    // v1.3.8 fair-share state: which albums are downloading, in start order,
+    // and how many of their files are in flight right now. All guarded by
+    // _fairLock; the pump takes a slot only while below its live share.
+    private readonly object _fairLock = new();
+    private readonly Dictionary<string, int> _fairSeq = new();
+    private readonly Dictionary<string, int> _fairInFlight = new();
+    private int _fairNextSeq;
 
     public DownloadEngine(int maxConcurrentFiles = 3)
     {
@@ -115,17 +126,17 @@ public sealed class DownloadEngine
             });
         }
 
+        FairRegister(entry.Id);
         try
         {
             entry.BothLinksFailed = false; // reset per download attempt
             // Build per-file work items from the PRIMARY host.
             var work = await BuildWorkItemsAsync(entry, entry.PrimaryHost, targetDir, ct);
 
-            var tasks = work.Select(w => DownloadFileAsync(entry, w, targetDir,
+            await PumpFilesAsync(entry, work, targetDir,
                 bytes => { Interlocked.Add(ref totalDownloaded, bytes); },
                 () => { if (DateTime.UtcNow - lastTick >= TickInterval) Tick(); },
-                ct)).ToArray();
-            await Task.WhenAll(tasks);
+                ct);
 
             Report(EntryStatus.Completed, "Completed");
         }
@@ -136,6 +147,106 @@ public sealed class DownloadEngine
         catch (Exception ex)
         {
             Report(EntryStatus.Failed, entry.BothLinksFailed ? "Both links failed" : "Failed: " + ex.Message);
+        }
+        finally
+        {
+            FairUnregister(entry.Id);
+        }
+    }
+
+    // ---------- v1.3.8 fair share (user spec 2026-11-27) ----------
+    // The N file slots are divided equally among the albums currently
+    // downloading. The old code fanned out ALL of one album's files at once
+    // and let the FIFO global semaphore hand every slot to the first album,
+    // so rows 2-3 sat at "Starting…" until album 1 finished. Now each album
+    // launches a file only while below its LIVE share (recomputed as albums
+    // start/finish), so 3 rows always progress at once and a lone album
+    // still uses all N slots.
+    private void FairRegister(string id)
+    {
+        lock (_fairLock)
+        {
+            _fairSeq[id] = _fairNextSeq++;
+            _fairInFlight[id] = 0;
+        }
+    }
+
+    private void FairUnregister(string id)
+    {
+        lock (_fairLock)
+        {
+            _fairSeq.Remove(id);
+            _fairInFlight.Remove(id);
+        }
+    }
+
+    // Atomically take one file slot for this album if it is below its live
+    // fair share: N slots divided among the running albums, remainder spread
+    // over the earliest starters (3 slots / 2 albums -> 2 and 1). If more
+    // albums run than slots (manual starts past the feeder cap), the first
+    // N albums get 1 and the rest 0 until a slot frees.
+    private bool FairTryTake(string id)
+    {
+        lock (_fairLock)
+        {
+            if (!_fairSeq.TryGetValue(id, out int seq)) return false;
+            int count = _fairSeq.Count;
+            int @base = MaxConcurrentFiles / count;
+            int rem = MaxConcurrentFiles % count;
+            int rank = 0;
+            foreach (int s in _fairSeq.Values) if (s < seq) rank++;
+            int share = @base + (rank < rem ? 1 : 0);
+            int inFlight = _fairInFlight.TryGetValue(id, out int n) ? n : 0;
+            if (inFlight >= share) return false;
+            _fairInFlight[id] = inFlight + 1;
+            return true;
+        }
+    }
+
+    private void FairRelease(string id)
+    {
+        lock (_fairLock)
+        {
+            if (_fairInFlight.ContainsKey(id)) _fairInFlight[id]--;
+        }
+    }
+
+    // Pump one album's files through its live fair share. A file error is
+    // rethrown at once — exactly like the old Task.WhenAll did — so the
+    // album reports Failed and the other files stop launching (in-flight
+    // files finish like before). Cancellation surfaces as Paused via the
+    // caller's catch.
+    private async Task PumpFilesAsync(LeecherEntry entry, List<FileWork> work, string targetDir,
+        Action<long> addBytes, Action maybeTick, CancellationToken ct)
+    {
+        var running = new List<Task>();
+        int next = 0;
+        while (next < work.Count || running.Count > 0)
+        {
+            ct.ThrowIfCancellationRequested();
+            while (next < work.Count && FairTryTake(entry.Id))
+            {
+                var w = work[next++];
+                var t = DownloadFileAsync(entry, w, targetDir, addBytes, maybeTick, ct);
+                _ = t.ContinueWith(_ => FairRelease(entry.Id), TaskScheduler.Default);
+                running.Add(t);
+            }
+            if (running.Count == 0)
+            {
+                // Share is 0 (more albums than slots): wait for an album to finish.
+                await Task.Delay(200, ct);
+                continue;
+            }
+            // Wake when a file finishes, or every 200 ms so a share that grew
+            // (another album finished) is picked up promptly.
+            await Task.WhenAny(Task.WhenAll(running), Task.Delay(200, ct));
+            for (int i = running.Count - 1; i >= 0; i--)
+            {
+                if (!running[i].IsCompleted) continue;
+                var task = running[i];
+                running.RemoveAt(i);
+                if (task.Exception != null) throw task.Exception.InnerException ?? task.Exception;
+            }
         }
     }
 

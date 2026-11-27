@@ -459,9 +459,10 @@ public partial class MainWindow : Window
         {
             var list = _rows.Where(x => x.Status is EntryStatus.Ready or EntryStatus.Paused or EntryStatus.Failed).ToList();
             // v1.3.7: Download All runs up to N albums at once (N = Options ->
-            // Max concurrent files, the IDM-style number the user picks). The
-            // engine's file-slot pool is the same N, so N single-file albums
-            // transfer N files at once; multi-file folders share the pool.
+            // Max concurrent files, the IDM-style number the user picks).
+            // v1.3.8: the engine divides the N file slots fairly among the
+            // running albums, so 3 rows progress at once even when each is a
+            // multi-file folder; a lone album still uses all N slots.
             var running = new List<Task>();
             foreach (var entry in list)
             {
